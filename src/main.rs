@@ -4,8 +4,20 @@
 #![no_std]
 #![no_main]
 
-use bsp::entry;
-use defmt::*;
+use core::str::FromStr;
+
+extern crate alloc;
+use alloc::vec::Vec;
+use ax25::frame::{
+    Address, Ax25Frame, CommandResponse, FrameContent, ProtocolIdentifier, UnnumberedInformation,
+};
+use bsp::{
+    entry,
+    hal::{
+        fugit::HertzU32,
+        uart::{self, UartPeripheral},
+    },
+};
 use defmt_rtt as _;
 use embedded_hal::digital::OutputPin;
 use panic_probe as _;
@@ -22,9 +34,19 @@ use bsp::hal::{
     watchdog::Watchdog,
 };
 
+use embedded_alloc::Heap;
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
 #[entry]
 fn main() -> ! {
-    info!("Program start");
+    {
+        use core::mem::MaybeUninit;
+        const HEAP_SIZE: usize = 1024;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+    }
+
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
@@ -52,26 +74,49 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    //
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead.
-    // One way to do that is by using [embassy](https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/wifi_blinky.rs)
-    //
-    // If you have a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here. Don't forget adding an appropriate resistor
-    // in series with the LED.
     let mut led_pin = pins.led.into_push_pull_output();
 
+    // setup UART on pin 4 (RX) and pin 5 (TX)
+    let uart = uart::UartPeripheral::new(
+        pac.UART1,
+        (pins.gpio4.into_function(), pins.gpio5.into_function()),
+        &mut pac.RESETS,
+    )
+    .enable(
+        uart::UartConfig::new(
+            HertzU32::Hz(115200),
+            uart::DataBits::Eight,
+            None,
+            uart::StopBits::One,
+        ),
+        clocks.peripheral_clock.freq(),
+    )
+    .unwrap();
+
     loop {
-        info!("on!");
         led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        info!("off!");
+        send_test_frame(&uart);
         led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+
+        delay.delay_ms(3000);
     }
+}
+
+fn send_test_frame<D: uart::UartDevice, P: uart::ValidUartPinout<D>>(
+    uart: &UartPeripheral<uart::Enabled, D, P>,
+) {
+    let frame = Ax25Frame {
+        source: Address::from_str("NOCALL-1").unwrap(),
+        destination: Address::from_str("NOCALL-2").unwrap(),
+        route: Vec::new(),
+        command_or_response: Some(CommandResponse::Command),
+        content: FrameContent::UnnumberedInformation(UnnumberedInformation {
+            pid: ProtocolIdentifier::None,
+            poll_or_final: false,
+            info: Vec::from("Hello, World!".as_bytes()),
+        }),
+    };
+    uart.write_full_blocking(&frame.to_bytes());
 }
 
 // End of file
